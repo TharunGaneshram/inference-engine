@@ -1,0 +1,6 @@
+cmake>=3.24
+numpy
+pytest
+safetensors
+torch==2.8.0
+transformers
