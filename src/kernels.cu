@@ -72,6 +72,125 @@ __global__ void rmsnorm_kernel(const T* x, const T* weight, T* out,
 }
 
 template <typename T>
+__global__ void residual_rmsnorm_kernel(const T* x, const T* proj,
+                                        const T* weight, T* residual,
+                                        T* normalized, int rows, int hidden,
+                                        float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  __shared__ float partial[256];
+  const size_t base = static_cast<size_t>(row) * hidden;
+  float sum = 0.0f;
+  for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+    const T value = from_float<T>(to_float(x[base + i]) + to_float(proj[base + i]));
+    residual[base + i] = value;
+    const float f = to_float(value);
+    sum += f * f;
+  }
+  partial[threadIdx.x] = sum;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+    __syncthreads();
+  }
+  const float inv = rsqrtf(partial[0] / hidden + eps);
+  for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+    float value = to_float(residual[base + i]) * inv;
+    if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+      value = to_float(from_float<T>(value));
+    }
+    normalized[base + i] = from_float<T>(value * to_float(weight[i]));
+  }
+}
+
+template <typename T>
+__global__ void project_rope_cache_kernel(
+    const T* x, const T* weight, T* cache,
+    const float* cos_table, const float* sin_table,
+    int start_pos, int rows, int n_kv_heads, int head_dim, int hidden) {
+  const int pairs_per_row = n_kv_heads * (head_dim / 2);
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int pair_index = blockIdx.x * (blockDim.x >> 5) + warp;
+  if (pair_index >= rows * pairs_per_row) return;
+  const int row = pair_index / pairs_per_row;
+  const int pair = pair_index % pairs_per_row;
+  const int head = pair / (head_dim / 2);
+  const int i = pair % (head_dim / 2);
+  const int j = i + head_dim / 2;
+  const int n0 = head * head_dim + i;
+  const int n1 = head * head_dim + j;
+  const T* input = x + static_cast<size_t>(row) * hidden;
+  float a = 0.0f;
+  float b = 0.0f;
+  for (int k = lane; k < hidden; k += 32) {
+    const float xv = to_float(input[k]);
+    a += xv * to_float(weight[static_cast<size_t>(n0) * hidden + k]);
+    b += xv * to_float(weight[static_cast<size_t>(n1) * hidden + k]);
+  }
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    a += __shfl_down_sync(0xffffffff, a, offset);
+    b += __shfl_down_sync(0xffffffff, b, offset);
+  }
+  if (lane != 0) return;
+  if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+    a = to_float(from_float<T>(a));
+    b = to_float(from_float<T>(b));
+  }
+  const size_t table_idx = static_cast<size_t>(start_pos + row) * (head_dim / 2) + i;
+  const float c = cos_table[table_idx];
+  const float s = sin_table[table_idx];
+  T* dst = cache + static_cast<size_t>(row) * pairs_per_row * 2 + head * head_dim;
+  dst[i] = from_float<T>(a * c - b * s);
+  dst[j] = from_float<T>(b * c + a * s);
+}
+
+template <typename T>
+__global__ void linear_swiglu_kernel(
+    const T* x, const T* gate_weight, const T* up_weight, T* out, int rows,
+    int intermediate, int hidden) {
+  const size_t count = static_cast<size_t>(rows) * intermediate;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const size_t index = static_cast<size_t>(blockIdx.x) * (blockDim.x >> 5) + warp;
+  if (index >= count) return;
+  const int row = static_cast<int>(index / intermediate);
+  const int col = static_cast<int>(index % intermediate);
+  const T* input = x + static_cast<size_t>(row) * hidden;
+  const T* gw = gate_weight + static_cast<size_t>(col) * hidden;
+  const T* uw = up_weight + static_cast<size_t>(col) * hidden;
+  float gate = 0.0f;
+  float up = 0.0f;
+  if constexpr (std::is_same<T, float>::value) {
+    if (lane != 0) return;
+    for (int k = 0; k < hidden; ++k) {
+      gate += input[k] * gw[k];
+      up += input[k] * uw[k];
+    }
+  } else {
+    for (int k = lane; k < hidden; k += 32) {
+      const float xv = to_float(input[k]);
+      gate += xv * to_float(gw[k]);
+      up += xv * to_float(uw[k]);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      gate += __shfl_down_sync(0xffffffff, gate, offset);
+      up += __shfl_down_sync(0xffffffff, up, offset);
+    }
+    if (lane != 0) return;
+  }
+  if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+    gate = to_float(from_float<T>(gate));
+    up = to_float(from_float<T>(up));
+  }
+  float activated = gate / (1.0f + expf(-gate));
+  if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+    activated = to_float(from_float<T>(activated));
+  }
+  out[index] = from_float<T>(activated * up);
+}
+
+template <typename T>
 __global__ void swiglu_kernel(const T* gate, const T* up, T* out, size_t n) {
   const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= n) return;
@@ -239,6 +358,82 @@ extern "C" int engine_residual_bf16(const __nv_bfloat16* a,
   return static_cast<int>(cudaGetLastError());
 }
 
+extern "C" int engine_residual_rmsnorm_f32(
+    const float* x, const float* proj, const float* weight, float* residual,
+    float* normalized, int rows, int hidden, float eps, cudaStream_t stream) {
+  if (!x || !proj || !weight || !residual || !normalized || rows <= 0 || hidden <= 0)
+    return int(cudaErrorInvalidValue);
+  residual_rmsnorm_kernel<<<rows, 256, 0, stream>>>(
+      x, proj, weight, residual, normalized, rows, hidden, eps);
+  return int(cudaGetLastError());
+}
+
+extern "C" int engine_residual_rmsnorm_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* proj,
+    const __nv_bfloat16* weight, __nv_bfloat16* residual,
+    __nv_bfloat16* normalized, int rows, int hidden, float eps,
+    cudaStream_t stream) {
+  if (!x || !proj || !weight || !residual || !normalized || rows <= 0 || hidden <= 0)
+    return int(cudaErrorInvalidValue);
+  residual_rmsnorm_kernel<<<rows, 256, 0, stream>>>(
+      x, proj, weight, residual, normalized, rows, hidden, eps);
+  return int(cudaGetLastError());
+}
+
+extern "C" int engine_project_rope_cache_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight,
+    __nv_bfloat16* cache, const float* cos_table, const float* sin_table,
+    int start_pos, int rows, int n_kv_heads, int head_dim, int hidden,
+    cudaStream_t stream) {
+  if (!x || !weight || !cache || !cos_table || !sin_table || start_pos < 0 ||
+      rows <= 0 || n_kv_heads <= 0 || head_dim <= 0 || head_dim % 2 || hidden <= 0)
+    return int(cudaErrorInvalidValue);
+  const int pairs = rows * n_kv_heads * (head_dim / 2);
+  project_rope_cache_kernel<<<(pairs + 7) / 8, 256, 0, stream>>>(
+      x, weight, cache, cos_table, sin_table, start_pos, rows, n_kv_heads,
+      head_dim, hidden);
+  return int(cudaGetLastError());
+}
+
+extern "C" int engine_project_rope_cache_f32(
+    const float* x, const float* weight, float* cache, const float* cos_table,
+    const float* sin_table, int start_pos, int rows, int n_kv_heads,
+    int head_dim, int hidden, cudaStream_t stream) {
+  if (!x || !weight || !cache || !cos_table || !sin_table || start_pos < 0 ||
+      rows <= 0 || n_kv_heads <= 0 || head_dim <= 0 || head_dim % 2 || hidden <= 0)
+    return int(cudaErrorInvalidValue);
+  const int pairs = rows * n_kv_heads * (head_dim / 2);
+  project_rope_cache_kernel<<<(pairs + 7) / 8, 256, 0, stream>>>(
+      x, weight, cache, cos_table, sin_table, start_pos, rows, n_kv_heads,
+      head_dim, hidden);
+  return int(cudaGetLastError());
+}
+
+extern "C" int engine_linear_swiglu_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* gate_weight,
+    const __nv_bfloat16* up_weight, __nv_bfloat16* out, int rows,
+    int intermediate, int hidden, cudaStream_t stream) {
+  if (!x || !gate_weight || !up_weight || !out || rows <= 0 ||
+      intermediate <= 0 || hidden <= 0)
+    return int(cudaErrorInvalidValue);
+  const size_t count = static_cast<size_t>(rows) * intermediate;
+  linear_swiglu_kernel<<<(count + 7) / 8, 256, 0, stream>>>(
+      x, gate_weight, up_weight, out, rows, intermediate, hidden);
+  return int(cudaGetLastError());
+}
+
+extern "C" int engine_linear_swiglu_f32(
+    const float* x, const float* gate_weight, const float* up_weight,
+    float* out, int rows, int intermediate, int hidden, cudaStream_t stream) {
+  if (!x || !gate_weight || !up_weight || !out || rows <= 0 ||
+      intermediate <= 0 || hidden <= 0)
+    return int(cudaErrorInvalidValue);
+  const size_t count = static_cast<size_t>(rows) * intermediate;
+  linear_swiglu_kernel<<<(count + 7) / 8, 256, 0, stream>>>(
+      x, gate_weight, up_weight, out, rows, intermediate, hidden);
+  return int(cudaGetLastError());
+}
+
 extern "C" int engine_embedding_f32(const float* table, const int* ids,
                                      float* out, int rows, int hidden,
                                      cudaStream_t stream) {
@@ -370,8 +565,8 @@ extern "C" int engine_rope_f32(float* q, float* k, const float* cos_table,
                                const float* sin_table, int start_pos, int rows,
                                int n_heads, int n_kv_heads, int head_dim,
                                cudaStream_t stream) {
-  if (!q || !k || !cos_table || !sin_table || start_pos < 0 || rows <= 0 ||
-      n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || head_dim % 2) {
+  if (!q || (!k && n_kv_heads > 0) || !cos_table || !sin_table || start_pos < 0 || rows <= 0 ||
+      n_heads <= 0 || n_kv_heads < 0 || head_dim <= 0 || head_dim % 2) {
     return int(cudaErrorInvalidValue);
   }
   rope_kernel<<<rows, 256, 0, stream>>>(q, k, cos_table, sin_table, start_pos,
@@ -384,8 +579,8 @@ extern "C" int engine_rope_bf16(__nv_bfloat16* q, __nv_bfloat16* k,
                                 int start_pos, int rows, int n_heads,
                                 int n_kv_heads, int head_dim,
                                 cudaStream_t stream) {
-  if (!q || !k || !cos_table || !sin_table || start_pos < 0 || rows <= 0 ||
-      n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || head_dim % 2) {
+  if (!q || (!k && n_kv_heads > 0) || !cos_table || !sin_table || start_pos < 0 || rows <= 0 ||
+      n_heads <= 0 || n_kv_heads < 0 || head_dim <= 0 || head_dim % 2) {
     return int(cudaErrorInvalidValue);
   }
   rope_kernel<<<rows, 256, 0, stream>>>(q, k, cos_table, sin_table, start_pos,

@@ -201,27 +201,40 @@ struct Engine {
   }
 
   int forward(const int* ids_host, int m, int max_layers = -1,
-              bool want_token = true) {
+              bool want_token = true, const int* ids_device = nullptr) {
     if (!finalized) throw std::runtime_error("engine_forward: weights are not finalized");
-    if (!ids_host || m <= 0 || m > ws.max_tokens) {
+    if ((!ids_host && !ids_device) || m <= 0 || m > ws.max_tokens) {
       throw std::runtime_error("engine_forward: token count must be between 1 and 2048");
     }
     if (kv_len + m > cfg.max_seq) throw std::runtime_error("engine_forward: prompt exceeds max_seq");
     const int n_run = max_layers < 0 ? cfg.n_layers : max_layers;
     if (n_run < 0 || n_run > cfg.n_layers) throw std::runtime_error("engine_forward: max_layers is out of range");
-    for (int i = 0; i < m; ++i) {
-      if (ids_host[i] < 0 || ids_host[i] >= cfg.vocab) {
-        throw std::runtime_error("engine_forward: token id is outside the vocabulary");
+    if (ids_host) {
+      for (int i = 0; i < m; ++i) {
+        if (ids_host[i] < 0 || ids_host[i] >= cfg.vocab) {
+          throw std::runtime_error("engine_forward: token id is outside the vocabulary");
+        }
       }
     }
     const int p = kv_len;
     last_rows = m;
-    check_cuda(cudaMemcpyAsync(ws.ids.ptr, ids_host, size_t(m) * sizeof(int),
-                               cudaMemcpyHostToDevice, stream.stream), "copy input token ids");
+    if (ids_host) {
+      check_cuda(cudaMemcpyAsync(ws.ids.ptr, ids_host, size_t(m) * sizeof(int),
+                                 cudaMemcpyHostToDevice, stream.stream), "copy input token ids");
+    }
+    const int* ids = ids_device ? ids_device : static_cast<const int*>(ws.ids.ptr);
     check_launch(engine_embedding_bf16(
         static_cast<const __nv_bfloat16*>(tensor("model.embed_tokens.weight")),
-        static_cast<const int*>(ws.ids.ptr), static_cast<__nv_bfloat16*>(ws.x.ptr),
+        ids, static_cast<__nv_bfloat16*>(ws.x.ptr),
         m, cfg.hidden, stream.stream), "embedding");
+
+    if (n_run > 0) {
+      check_launch(engine_rmsnorm_bf16(
+          static_cast<const __nv_bfloat16*>(ws.x.ptr),
+          static_cast<const __nv_bfloat16*>(layer_tensor(0, "input_layernorm.weight")),
+          static_cast<__nv_bfloat16*>(ws.xn.ptr), m, cfg.hidden, cfg.rms_eps,
+          stream.stream), "attention RMSNorm");
+    }
 
     const size_t kv_layer_bytes = size_t(cfg.max_seq) * cfg.n_kv_heads * cfg.head_dim * sizeof(uint16_t);
     for (int l = 0; l < n_run; ++l) {
@@ -232,24 +245,52 @@ struct Engine {
       auto* proj = static_cast<__nv_bfloat16*>(ws.proj.ptr);
       auto* kc = reinterpret_cast<__nv_bfloat16*>(static_cast<char*>(kv_k.ptr) + l * kv_layer_bytes) + size_t(p) * cfg.n_kv_heads * cfg.head_dim;
       auto* vc = reinterpret_cast<__nv_bfloat16*>(static_cast<char*>(kv_v.ptr) + l * kv_layer_bytes) + size_t(p) * cfg.n_kv_heads * cfg.head_dim;
-      check_launch(engine_rmsnorm_bf16(x, static_cast<const __nv_bfloat16*>(layer_tensor(l, "input_layernorm.weight")), xn, m, cfg.hidden, cfg.rms_eps, stream.stream), "attention RMSNorm");
       linear(xn, static_cast<const __nv_bfloat16*>(layer_tensor(l, "self_attn.q_proj.weight")), q, m, cfg.hidden, cfg.hidden);
-      linear(xn, static_cast<const __nv_bfloat16*>(layer_tensor(l, "self_attn.k_proj.weight")), kc, m, cfg.n_kv_heads * cfg.head_dim, cfg.hidden);
+      check_launch(engine_project_rope_cache_bf16(
+          xn, static_cast<const __nv_bfloat16*>(layer_tensor(l, "self_attn.k_proj.weight")),
+          kc, static_cast<const float*>(rope_cos.ptr), static_cast<const float*>(rope_sin.ptr),
+          p, m, cfg.n_kv_heads, cfg.head_dim, cfg.hidden, stream.stream),
+          "K projection + RoPE + KV-cache store");
       linear(xn, static_cast<const __nv_bfloat16*>(layer_tensor(l, "self_attn.v_proj.weight")), vc, m, cfg.n_kv_heads * cfg.head_dim, cfg.hidden);
-      check_launch(engine_rope_bf16(q, kc, static_cast<const float*>(rope_cos.ptr), static_cast<const float*>(rope_sin.ptr), p, m, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, stream.stream), "RoPE");
+      check_launch(engine_rope_bf16(q, nullptr, static_cast<const float*>(rope_cos.ptr), static_cast<const float*>(rope_sin.ptr), p, m, cfg.n_heads, 0, cfg.head_dim, stream.stream), "Q RoPE");
       auto* kbase = reinterpret_cast<const __nv_bfloat16*>(static_cast<char*>(kv_k.ptr) + l * kv_layer_bytes);
       auto* vbase = reinterpret_cast<const __nv_bfloat16*>(static_cast<char*>(kv_v.ptr) + l * kv_layer_bytes);
       check_launch(engine_attention_bf16(q, kbase, vbase, attn, p, m, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, 1.0f / std::sqrt(static_cast<float>(cfg.head_dim)), stream.stream), "attention");
       linear(attn, static_cast<const __nv_bfloat16*>(layer_tensor(l, "self_attn.o_proj.weight")), proj, m, cfg.hidden, cfg.hidden);
-      check_launch(engine_residual_bf16(x, proj, x, size_t(m) * cfg.hidden, stream.stream), "attention residual add");
-      check_launch(engine_rmsnorm_bf16(x, static_cast<const __nv_bfloat16*>(layer_tensor(l, "post_attention_layernorm.weight")), xn, m, cfg.hidden, cfg.rms_eps, stream.stream), "MLP RMSNorm");
+      check_launch(engine_residual_rmsnorm_bf16(
+          x, proj,
+          static_cast<const __nv_bfloat16*>(layer_tensor(l, "post_attention_layernorm.weight")),
+          x, xn, m, cfg.hidden, cfg.rms_eps, stream.stream),
+          "attention residual + MLP RMSNorm");
       auto* gate = static_cast<__nv_bfloat16*>(ws.gate.ptr);
-      auto* up = static_cast<__nv_bfloat16*>(ws.up.ptr);
-      linear(xn, static_cast<const __nv_bfloat16*>(layer_tensor(l, "mlp.gate_proj.weight")), gate, m, cfg.intermediate, cfg.hidden);
-      linear(xn, static_cast<const __nv_bfloat16*>(layer_tensor(l, "mlp.up_proj.weight")), up, m, cfg.intermediate, cfg.hidden);
-      check_launch(engine_swiglu_bf16(gate, up, gate, size_t(m) * cfg.intermediate, stream.stream), "SwiGLU");
+      check_launch(engine_linear_swiglu_bf16(
+          xn,
+          static_cast<const __nv_bfloat16*>(layer_tensor(l, "mlp.gate_proj.weight")),
+          static_cast<const __nv_bfloat16*>(layer_tensor(l, "mlp.up_proj.weight")),
+          gate, m, cfg.intermediate, cfg.hidden, stream.stream),
+          "gate + up projections + SwiGLU");
       linear(gate, static_cast<const __nv_bfloat16*>(layer_tensor(l, "mlp.down_proj.weight")), proj, m, cfg.hidden, cfg.intermediate);
-      check_launch(engine_residual_bf16(x, proj, x, size_t(m) * cfg.hidden, stream.stream), "MLP residual add");
+      if (l + 1 < n_run) {
+        check_launch(engine_residual_rmsnorm_bf16(
+            x, proj,
+            static_cast<const __nv_bfloat16*>(layer_tensor(l + 1, "input_layernorm.weight")),
+            x, xn, m, cfg.hidden, cfg.rms_eps, stream.stream),
+            "MLP residual + next attention RMSNorm");
+      } else if (n_run == cfg.n_layers && max_layers < 0 && want_token) {
+        auto* last_x = x + size_t(m - 1) * cfg.hidden;
+        auto* last_proj = proj + size_t(m - 1) * cfg.hidden;
+        check_launch(engine_residual_rmsnorm_bf16(
+            last_x, last_proj,
+            static_cast<const __nv_bfloat16*>(tensor("model.norm.weight")),
+            last_x, static_cast<__nv_bfloat16*>(ws.xn.ptr), 1, cfg.hidden,
+            cfg.rms_eps, stream.stream), "MLP residual + final RMSNorm");
+        if (m > 1) {
+          check_launch(engine_residual_bf16(x, proj, x, size_t(m - 1) * cfg.hidden, stream.stream),
+                       "MLP residual add for preceding rows");
+        }
+      } else {
+        check_launch(engine_residual_bf16(x, proj, x, size_t(m) * cfg.hidden, stream.stream), "MLP residual add");
+      }
     }
 
     if (max_layers >= 0 || !want_token) {
@@ -257,8 +298,6 @@ struct Engine {
       check_cuda(cudaStreamSynchronize(stream.stream), "synchronize forward layers");
       return -1;
     }
-    auto* last_x = static_cast<__nv_bfloat16*>(ws.x.ptr) + size_t(m - 1) * cfg.hidden;
-    check_launch(engine_rmsnorm_bf16(last_x, static_cast<const __nv_bfloat16*>(tensor("model.norm.weight")), static_cast<__nv_bfloat16*>(ws.xn.ptr), 1, cfg.hidden, cfg.rms_eps, stream.stream), "final RMSNorm");
     check_launch(engine_gemv_bf16_f32(static_cast<const __nv_bfloat16*>(ws.xn.ptr), static_cast<const __nv_bfloat16*>(tensor("lm_head.weight")), static_cast<float*>(ws.logits.ptr), cfg.vocab, cfg.hidden, stream.stream), "lm_head GEMV");
     check_launch(engine_argmax_f32(static_cast<const float*>(ws.logits.ptr), static_cast<int*>(ws.next_token.ptr), cfg.vocab, stream.stream), "argmax");
     int token = -1;
@@ -275,6 +314,10 @@ struct Engine {
 
   int decode(int token) { return forward(&token, 1); }
 
+  int decode_device() {
+    return forward(nullptr, 1, -1, true, static_cast<const int*>(ws.next_token.ptr));
+  }
+
   std::vector<int> generate(const int* prompt, int n, int max_new) {
     if (!prompt || n <= 0) throw std::runtime_error("engine_generate: prompt must contain at least one token");
     if (n > cfg.max_seq) throw std::runtime_error("engine_generate: prompt exceeds max_seq");
@@ -290,7 +333,7 @@ struct Engine {
     }
     std::vector<int> output{token};
     while (static_cast<int>(output.size()) < max_new && token != cfg.eos_token_id && kv_len < cfg.max_seq) {
-      token = decode(token);
+      token = decode_device();
       output.push_back(token);
     }
     return output;

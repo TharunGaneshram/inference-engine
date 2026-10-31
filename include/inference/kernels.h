@@ -10,6 +10,32 @@ extern "C" int engine_residual_bf16(const __nv_bfloat16* a,
                                     const __nv_bfloat16* b,
                                     __nv_bfloat16* out, size_t n,
                                     cudaStream_t stream);
+extern "C" int engine_residual_rmsnorm_f32(const float* x, const float* proj,
+                                           const float* weight, float* residual,
+                                           float* normalized, int rows,
+                                           int hidden, float eps,
+                                           cudaStream_t stream);
+extern "C" int engine_residual_rmsnorm_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* proj,
+    const __nv_bfloat16* weight, __nv_bfloat16* residual,
+    __nv_bfloat16* normalized, int rows, int hidden, float eps,
+    cudaStream_t stream);
+extern "C" int engine_project_rope_cache_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight,
+    __nv_bfloat16* cache, const float* cos_table, const float* sin_table,
+    int start_pos, int rows, int n_kv_heads, int head_dim, int hidden,
+    cudaStream_t stream);
+extern "C" int engine_project_rope_cache_f32(
+    const float* x, const float* weight, float* cache, const float* cos_table,
+    const float* sin_table, int start_pos, int rows, int n_kv_heads,
+    int head_dim, int hidden, cudaStream_t stream);
+extern "C" int engine_linear_swiglu_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* gate_weight,
+    const __nv_bfloat16* up_weight, __nv_bfloat16* out, int rows,
+    int intermediate, int hidden, cudaStream_t stream);
+extern "C" int engine_linear_swiglu_f32(
+    const float* x, const float* gate_weight, const float* up_weight,
+    float* out, int rows, int intermediate, int hidden, cudaStream_t stream);
 
 extern "C" int engine_embedding_f32(const float* table, const int* ids,
                                      float* out, int rows, int hidden,
