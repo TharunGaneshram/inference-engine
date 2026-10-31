@@ -84,12 +84,38 @@ def test_gemm_awkward_bounds(dtype, fn, m):
     assert_reference(out, x, weight, dtype)
 
 
+@pytest.mark.parametrize("dtype,fn", [(torch.float32, gemm_f32), (torch.bfloat16, gemm_bf16)])
+@pytest.mark.parametrize("m", [3, 17])
+@pytest.mark.parametrize("n,k", MODEL_SHAPES[:-1])
+def test_gemm_prefill_model_shapes(dtype, fn, m, n, k):
+    torch.manual_seed(1234)
+    x = torch.randn(m, k, device="cuda", dtype=dtype)
+    weight = torch.randn(n, k, device="cuda", dtype=dtype)
+    out = torch.empty(m, n, device="cuda", dtype=dtype)
+    stream = torch.cuda.current_stream().cuda_stream
+    assert fn(x.data_ptr(), weight.data_ptr(), out.data_ptr(), m, n, k, stream) == 0
+    torch.cuda.synchronize()
+    assert_reference(out, x, weight, dtype, fp32_atol=1.5e-3 if k == 8192 else 1e-4)
+
+
 @pytest.mark.parametrize("dtype,fn", [(torch.float32, gemv_f32), (torch.bfloat16, gemv_bf16)])
-@pytest.mark.parametrize("n,k", MODEL_SHAPES + [(7, 33)])
+@pytest.mark.parametrize("n,k", MODEL_SHAPES + [(7, 33), (13, 70), (37, 129)])
 def test_gemv_model_and_awkward_shapes(dtype, fn, n, k):
     x = torch.randn(k, device="cuda", dtype=dtype)
     weight = torch.randn(n, k, device="cuda", dtype=dtype)
     out = torch.empty(n, device="cuda", dtype=dtype)
+    stream = torch.cuda.current_stream().cuda_stream
+    assert fn(x.data_ptr(), weight.data_ptr(), out.data_ptr(), n, k, stream) == 0
+    torch.cuda.synchronize()
+    assert_reference(out[None, :], x[None, :], weight, dtype)
+
+
+@pytest.mark.parametrize("dtype,fn", [(torch.float32, gemv_f32), (torch.bfloat16, gemv_bf16)])
+def test_gemv_unaligned_vector_tail(dtype, fn):
+    n, k = 37, 129
+    x = torch.randn(k + 1, device="cuda", dtype=dtype)[1:]
+    weight = torch.randn(n * k + 1, device="cuda", dtype=dtype)[1:].view(n, k)
+    out = torch.empty(n + 1, device="cuda", dtype=dtype)[1:]
     stream = torch.cuda.current_stream().cuda_stream
     assert fn(x.data_ptr(), weight.data_ptr(), out.data_ptr(), n, k, stream) == 0
     torch.cuda.synchronize()

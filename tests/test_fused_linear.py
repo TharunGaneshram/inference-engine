@@ -59,7 +59,7 @@ swiglu_f32 = launcher("engine_swiglu_f32", [C.c_void_p, C.c_void_p,
                                               C.c_void_p, C.c_size_t, C.c_void_p])
 
 
-@pytest.mark.parametrize("rows", [1, 3])
+@pytest.mark.parametrize("rows", [1, 3, 17])
 @pytest.mark.parametrize("start_pos", [0, 7])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_fused_k_rope_cache_matches_separate_path(rows, start_pos, dtype):
@@ -111,7 +111,7 @@ def test_fused_k_rope_cache_matches_separate_path(rows, start_pos, dtype):
         torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.parametrize("rows", [1, 3])
+@pytest.mark.parametrize("rows", [1, 3, 17])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_fused_gate_up_swiglu_matches_separate_path(rows, dtype):
     torch.manual_seed(1234)
@@ -127,10 +127,17 @@ def test_fused_gate_up_swiglu_matches_separate_path(rows, dtype):
     gemm_fn = gemm_f32 if dtype == torch.float32 else gemm
     swiglu_fn = swiglu_f32 if dtype == torch.float32 else swiglu
     fused_fn = fused_swiglu_f32 if dtype == torch.float32 else fused_swiglu
-    assert gemm_fn(x.data_ptr(), gate_weight.data_ptr(), gate.data_ptr(),
-                rows, intermediate, hidden, stream) == 0
-    assert gemm_fn(x.data_ptr(), up_weight.data_ptr(), up.data_ptr(),
-                rows, intermediate, hidden, stream) == 0
+    if rows == 1:
+        gemv_fn = gemv_f32 if dtype == torch.float32 else gemv
+        assert gemv_fn(x.data_ptr(), gate_weight.data_ptr(), gate.data_ptr(),
+                       intermediate, hidden, stream) == 0
+        assert gemv_fn(x.data_ptr(), up_weight.data_ptr(), up.data_ptr(),
+                       intermediate, hidden, stream) == 0
+    else:
+        assert gemm_fn(x.data_ptr(), gate_weight.data_ptr(), gate.data_ptr(),
+                       rows, intermediate, hidden, stream) == 0
+        assert gemm_fn(x.data_ptr(), up_weight.data_ptr(), up.data_ptr(),
+                       rows, intermediate, hidden, stream) == 0
     assert swiglu_fn(gate.data_ptr(), up.data_ptr(), expected.data_ptr(),
                   rows * intermediate, stream) == 0
     assert fused_fn(x.data_ptr(), gate_weight.data_ptr(), up_weight.data_ptr(),
@@ -145,4 +152,57 @@ def test_fused_gate_up_swiglu_matches_separate_path(rows, dtype):
         assert error.max() / scale < 1e-2
         assert cosine > 0.99999
     else:
+        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fused_linear_awkward_edges(dtype):
+    rows, hidden, n_kv, head_dim = 3, 33, 2, 64
+    n = n_kv * head_dim
+    x = torch.randn(rows, hidden, device="cuda", dtype=dtype)
+    weight = torch.randn(n, hidden, device="cuda", dtype=dtype)
+    actual_k = torch.empty(rows, n, device="cuda", dtype=dtype)
+    projected = torch.empty_like(actual_k)
+    cos = torch.randn(12, head_dim // 2, device="cuda")
+    sin = torch.randn_like(cos)
+    q = torch.empty(rows, head_dim, device="cuda", dtype=dtype)
+    gemm_fn, rope_fn = (gemm_f32, rope_f32) if dtype == torch.float32 else (gemm, rope)
+    k_fn = f32_k_cache if dtype == torch.float32 else k_cache
+    stream = torch.cuda.current_stream().cuda_stream
+    assert gemm_fn(x.data_ptr(), weight.data_ptr(), projected.data_ptr(),
+                   rows, n, hidden, stream) == 0
+    assert rope_fn(q.data_ptr(), projected.data_ptr(), cos.data_ptr(), sin.data_ptr(),
+                   7, rows, 1, n_kv, head_dim, stream) == 0
+    assert k_fn(x.data_ptr(), weight.data_ptr(), actual_k.data_ptr(), cos.data_ptr(),
+                sin.data_ptr(), 7, rows, n_kv, head_dim, hidden, stream) == 0
+
+    intermediate = 70
+    gate_weight = torch.randn(intermediate, hidden, device="cuda", dtype=dtype)
+    up_weight = torch.randn_like(gate_weight)
+    gate = torch.empty(rows, intermediate, device="cuda", dtype=dtype)
+    up = torch.empty_like(gate)
+    expected = torch.empty_like(gate)
+    actual = torch.empty_like(gate)
+    fused_fn = fused_swiglu_f32 if dtype == torch.float32 else fused_swiglu
+    swiglu_fn = swiglu_f32 if dtype == torch.float32 else swiglu
+    assert gemm_fn(x.data_ptr(), gate_weight.data_ptr(), gate.data_ptr(),
+                   rows, intermediate, hidden, stream) == 0
+    assert gemm_fn(x.data_ptr(), up_weight.data_ptr(), up.data_ptr(),
+                   rows, intermediate, hidden, stream) == 0
+    assert swiglu_fn(gate.data_ptr(), up.data_ptr(), expected.data_ptr(),
+                     rows * intermediate, stream) == 0
+    assert fused_fn(x.data_ptr(), gate_weight.data_ptr(), up_weight.data_ptr(),
+                    actual.data_ptr(), rows, intermediate, hidden, stream) == 0
+    torch.cuda.synchronize()
+    if dtype == torch.bfloat16:
+        torch.testing.assert_close(actual_k.float(), projected.float(), rtol=1e-2, atol=1e-3)
+        delta = (actual.float() - expected.float()).abs()
+        scale = expected.float().abs().max().clamp_min(1e-12)
+        cosine = torch.nn.functional.cosine_similarity(
+            actual.float().flatten(), expected.float().flatten(), dim=0
+        )
+        assert delta.max() / scale < 1e-2
+        assert cosine > 0.99999
+    else:
+        torch.testing.assert_close(actual_k, projected, rtol=1e-4, atol=1e-4)
         torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
